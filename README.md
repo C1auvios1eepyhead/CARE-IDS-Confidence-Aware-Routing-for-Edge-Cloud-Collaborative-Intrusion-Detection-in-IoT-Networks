@@ -54,27 +54,3 @@ Non-numeric and identifier-related columns are removed before model training. On
 
 Please obtain the dataset from the original source and place it under the local data directory before running the experiments.
 
-## Repository Structure
-
-```text
-CARE-IDS/
-├── data/
-│   └── README.md
-├── src/
-│   ├── preprocessing.py
-│   ├── models.py
-│   ├── routing.py
-│   ├── evaluation.py
-│   └── utils.py
-├── experiments/
-│   ├── run_edge_only.py
-│   ├── run_cloud_only.py
-│   ├── run_care_ids.py
-│   ├── run_threshold_analysis.py
-│   └── run_router_ablation.py
-├── results/
-│   ├── figures/
-│   └── tables/
-├── requirements.txt
-├── README.md
-└── LICENSE
