@@ -1,0 +1,490 @@
+import os
+import time
+import numpy as np
+import pandas as pd
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+
+
+# =========================================================
+# Config
+# =========================================================
+FOLD_DIR = "fold_data"
+N_SPLITS = 10
+RANDOM_STATE = 42
+
+OUTPUT_CSV = "edge_cloud_kfold_results.csv"
+
+
+# =========================================================
+# 1. Metrics
+# =========================================================
+def calc_metrics(y_true, y_pred):
+    acc = accuracy_score(y_true, y_pred)
+
+    f1 = f1_score(
+        y_true,
+        y_pred,
+        average="macro",
+        zero_division=0
+    )
+
+    precision = precision_score(
+        y_true,
+        y_pred,
+        average="macro",
+        zero_division=0
+    )
+
+    recall = recall_score(
+        y_true,
+        y_pred,
+        average="macro",
+        zero_division=0
+    )
+
+    return acc, f1, precision, recall
+
+
+# =========================================================
+# 2. Edge confidence
+# =========================================================
+def get_conf(model, X):
+    prob = model.predict_proba(X)
+    conf = np.max(prob, axis=1).reshape(-1, 1)
+    return conf
+
+
+# =========================================================
+# 3. Constant router fallback
+#    如果 router_y 只有一个类别，LogisticRegression 不能训练
+# =========================================================
+class ConstantRouter:
+    def __init__(self, decision):
+        self.decision = int(decision)
+
+    def predict(self, X):
+        return np.full(X.shape[0], self.decision, dtype=int)
+
+
+# =========================================================
+# 4. Build router dataset
+#
+# Router 学习：
+#   input:  Edge confidence
+#   label:  Edge 是否预测错误
+#
+# router_y:
+#   0 = Edge 预测正确，不需要送 Cloud
+#   1 = Edge 预测错误，应该送 Cloud
+# =========================================================
+def build_router_data(X_train, y_train, n_splits=5, random_state=42):
+    unique, counts = np.unique(y_train, return_counts=True)
+    min_class_count = counts.min()
+
+    inner_splits = min(n_splits, min_class_count)
+
+    if inner_splits < 2:
+        raise ValueError(
+            "Cannot build router data because at least one class has fewer than 2 samples "
+            "inside the training fold."
+        )
+
+    kf = StratifiedKFold(
+        n_splits=inner_splits,
+        shuffle=True,
+        random_state=random_state
+    )
+
+    router_X_list = []
+    router_y_list = []
+
+    print("Building router dataset by inner CV...")
+
+    for inner_fold_id, (tr_idx, val_idx) in enumerate(kf.split(X_train, y_train)):
+        X_tr = X_train[tr_idx]
+        X_val = X_train[val_idx]
+
+        y_tr = y_train[tr_idx]
+        y_val = y_train[val_idx]
+
+        edge_tmp = LogisticRegression(
+            max_iter=2000,
+            solver="lbfgs"
+        )
+
+        edge_tmp.fit(X_tr, y_tr)
+
+        conf = get_conf(edge_tmp, X_val)
+
+        pred = edge_tmp.predict(X_val)
+        err = (pred != y_val).astype(int)
+
+        router_X_list.append(conf)
+        router_y_list.append(err)
+
+    router_X = np.vstack(router_X_list)
+    router_y = np.concatenate(router_y_list)
+
+    return router_X, router_y
+
+
+# =========================================================
+# 5. Train router
+#    Router 用 LR 学习送检边界
+# =========================================================
+def train_router(router_X, router_y):
+    router_classes, router_counts = np.unique(router_y, return_counts=True)
+    router_dist = dict(zip(router_classes, router_counts))
+
+    print("Router label distribution:", router_dist)
+
+    if len(router_classes) < 2:
+        only_class = router_classes[0]
+
+        print(f"Router has only one class: {only_class}. Using constant router.")
+
+        router = ConstantRouter(decision=only_class)
+        router_type = "constant"
+        learned_boundary = np.nan
+
+        return router, router_type, learned_boundary
+
+    router = LogisticRegression(
+        max_iter=2000,
+        solver="lbfgs",
+        class_weight="balanced"
+    )
+
+    router.fit(router_X, router_y)
+
+    router_type = "logistic"
+
+    w = router.coef_[0][0]
+    b = router.intercept_[0]
+
+    if abs(w) > 1e-12:
+        learned_boundary = -b / w
+
+        if w < 0:
+            direction = "confidence <= boundary tends to upload"
+        else:
+            direction = "confidence >= boundary tends to upload"
+
+        print(f"Learned router confidence boundary: {learned_boundary:.6f}")
+        print(f"Router direction: {direction}")
+    else:
+        learned_boundary = np.nan
+        print("Router boundary is unavailable because coefficient is too close to zero.")
+
+    return router, router_type, learned_boundary
+
+
+# =========================================================
+# 6. Single-sample Edge-only inference
+# =========================================================
+def streaming_edge_inference(edge, X_test):
+    preds = []
+
+    start = time.perf_counter()
+
+    for i in range(len(X_test)):
+        x = X_test[i].reshape(1, -1)
+        pred = edge.predict(x)[0]
+        preds.append(pred)
+
+    total_time = time.perf_counter() - start
+
+    return np.array(preds), total_time
+
+
+# =========================================================
+# 7. Single-sample Cloud-only inference
+# =========================================================
+def streaming_cloud_inference(cloud, X_test):
+    preds = []
+
+    start = time.perf_counter()
+
+    for i in range(len(X_test)):
+        x = X_test[i].reshape(1, -1)
+        pred = cloud.predict(x)[0]
+        preds.append(pred)
+
+    total_time = time.perf_counter() - start
+
+    return np.array(preds), total_time
+
+
+# =========================================================
+# 8. Single-sample Hybrid inference
+#
+# 每条样本：
+#   1. 先送 Edge
+#   2. Edge 输出类别和 confidence
+#   3. Router 判断是否送 Cloud
+#   4. router_decision = 0: 使用 Edge 结果
+#   5. router_decision = 1: 上传 Cloud
+# =========================================================
+def streaming_hybrid_inference(edge, cloud, router, X_test):
+    preds = []
+
+    cloud_call_count = 0
+
+    start = time.perf_counter()
+
+    for i in range(len(X_test)):
+        x = X_test[i].reshape(1, -1)
+
+        e_prob = edge.predict_proba(x)
+        e_conf = np.max(e_prob).reshape(1, -1)
+
+        e_pred = edge.classes_[np.argmax(e_prob)]
+
+        router_decision = router.predict(e_conf)[0]
+
+        if router_decision == 0:
+            pred = e_pred
+        else:
+            pred = cloud.predict(x)[0]
+            cloud_call_count += 1
+
+        preds.append(pred)
+
+    total_time = time.perf_counter() - start
+
+    communication_ratio = cloud_call_count / len(X_test)
+
+    return np.array(preds), total_time, communication_ratio, cloud_call_count
+
+
+# =========================================================
+# 9. Load one fold
+# =========================================================
+def load_fold(fold_dir, fold_id):
+    X_train_path = os.path.join(fold_dir, f"X_train_fold{fold_id}.npy")
+    y_train_path = os.path.join(fold_dir, f"y_train_fold{fold_id}.npy")
+
+    X_test_path = os.path.join(fold_dir, f"X_test_fold{fold_id}.npy")
+    y_test_path = os.path.join(fold_dir, f"y_test_fold{fold_id}.npy")
+
+    X_train = np.load(X_train_path).astype(np.float32)
+    y_train = np.load(y_train_path, allow_pickle=True)
+
+    X_test = np.load(X_test_path).astype(np.float32)
+    y_test = np.load(y_test_path, allow_pickle=True)
+
+    return X_train, y_train, X_test, y_test
+
+
+# =========================================================
+# 10. Main experiment
+# =========================================================
+def run_experiment(
+        fold_dir=FOLD_DIR,
+        n_splits=N_SPLITS,
+        random_state=RANDOM_STATE,
+        output_csv=OUTPUT_CSV
+):
+    results = []
+
+    for fold_id in range(n_splits):
+        print(f"\n========== Fold {fold_id} ==========")
+
+        X_train_raw, y_train, X_test_raw, y_test = load_fold(fold_dir, fold_id)
+
+        print("Train shape:", X_train_raw.shape)
+        print("Test shape:", X_test_raw.shape)
+
+        train_unique, train_counts = np.unique(y_train, return_counts=True)
+        test_unique, test_counts = np.unique(y_test, return_counts=True)
+
+        print("Train distribution:", dict(zip(train_unique, train_counts)))
+        print("Test distribution:", dict(zip(test_unique, test_counts)))
+
+        # -------------------------------------------------
+        # Scale
+        # 只在 train 上 fit，防止数据泄漏
+        # -------------------------------------------------
+        scaler = StandardScaler()
+
+        X_train = scaler.fit_transform(X_train_raw)
+        X_test = scaler.transform(X_test_raw)
+
+        # -------------------------------------------------
+        # Edge model: Logistic Regression
+        # -------------------------------------------------
+        print("Training Edge model: LogisticRegression...")
+
+        edge = LogisticRegression(
+            max_iter=2000,
+            solver="lbfgs"
+        )
+
+        edge.fit(X_train, y_train)
+
+        # -------------------------------------------------
+        # Cloud model: Random Forest
+        # -------------------------------------------------
+        print("Training Cloud model: RandomForestClassifier...")
+
+        cloud = RandomForestClassifier(
+            n_estimators=200,
+            max_depth=None,
+            n_jobs=-1,
+            random_state=random_state
+        )
+
+        cloud.fit(X_train, y_train)
+
+        # -------------------------------------------------
+        # Router model
+        # -------------------------------------------------
+        router_X, router_y = build_router_data(
+            X_train=X_train,
+            y_train=y_train,
+            n_splits=5,
+            random_state=random_state
+        )
+
+        router, router_type, learned_boundary = train_router(router_X, router_y)
+
+        # -------------------------------------------------
+        # Single-sample inference
+        # 三个 baseline 全部逐条送检，保证时间对齐
+        # -------------------------------------------------
+        print("Running single-sample Edge-only inference...")
+        edge_pred, edge_time = streaming_edge_inference(edge, X_test)
+
+        print("Running single-sample Cloud-only inference...")
+        cloud_pred, cloud_time = streaming_cloud_inference(cloud, X_test)
+
+        print("Running single-sample Hybrid inference...")
+        hybrid_pred, hybrid_time, hybrid_comm_ratio, hybrid_cloud_calls = streaming_hybrid_inference(
+            edge=edge,
+            cloud=cloud,
+            router=router,
+            X_test=X_test
+        )
+
+        # -------------------------------------------------
+        # Metrics
+        # -------------------------------------------------
+        e_acc, e_f1, e_precision, e_recall = calc_metrics(y_test, edge_pred)
+        c_acc, c_f1, c_precision, c_recall = calc_metrics(y_test, cloud_pred)
+        h_acc, h_f1, h_precision, h_recall = calc_metrics(y_test, hybrid_pred)
+
+        n_test = len(X_test)
+
+        edge_time_per_sample = edge_time / n_test
+        cloud_time_per_sample = cloud_time / n_test
+        hybrid_time_per_sample = hybrid_time / n_test
+
+        if hybrid_time > 0:
+            speedup_vs_cloud = cloud_time / hybrid_time
+        else:
+            speedup_vs_cloud = np.nan
+
+        cloud_call_reduction = 1.0 - hybrid_comm_ratio
+
+        results.append({
+            "fold": fold_id,
+
+            "edge_acc": e_acc,
+            "edge_f1": e_f1,
+            "edge_precision": e_precision,
+            "edge_recall": e_recall,
+
+            "cloud_acc": c_acc,
+            "cloud_f1": c_f1,
+            "cloud_precision": c_precision,
+            "cloud_recall": c_recall,
+
+            "hybrid_acc": h_acc,
+            "hybrid_f1": h_f1,
+            "hybrid_precision": h_precision,
+            "hybrid_recall": h_recall,
+
+            "edge_time": edge_time,
+            "cloud_time": cloud_time,
+            "hybrid_time": hybrid_time,
+
+            "edge_time_per_sample": edge_time_per_sample,
+            "cloud_time_per_sample": cloud_time_per_sample,
+            "hybrid_time_per_sample": hybrid_time_per_sample,
+
+            "edge_communication_ratio": 0.0,
+            "cloud_communication_ratio": 1.0,
+            "hybrid_communication_ratio": hybrid_comm_ratio,
+
+            "hybrid_cloud_calls": hybrid_cloud_calls,
+            "test_samples": n_test,
+            "cloud_call_reduction": cloud_call_reduction,
+
+            "speedup_vs_cloud": speedup_vs_cloud,
+
+            "router_type": router_type,
+            "router_learned_conf_boundary": learned_boundary
+        })
+
+        print(
+            f"Edge Acc={e_acc:.4f}, F1={e_f1:.4f}, Time={edge_time:.6f}s | "
+            f"Cloud Acc={c_acc:.4f}, F1={c_f1:.4f}, Time={cloud_time:.6f}s | "
+            f"Hybrid Acc={h_acc:.4f}, F1={h_f1:.4f}, Time={hybrid_time:.6f}s | "
+            f"Hybrid Comm={hybrid_comm_ratio:.4f} | "
+            f"Speedup vs Cloud={speedup_vs_cloud:.4f}"
+        )
+
+    result_df = pd.DataFrame(results)
+
+    result_df.to_csv(output_csv, index=False)
+
+    print(f"\nSaved results to: {output_csv}")
+
+    metric_cols = [
+        "edge_acc",
+        "edge_f1",
+        "cloud_acc",
+        "cloud_f1",
+        "hybrid_acc",
+        "hybrid_f1",
+        "edge_time",
+        "cloud_time",
+        "hybrid_time",
+        "edge_time_per_sample",
+        "cloud_time_per_sample",
+        "hybrid_time_per_sample",
+        "hybrid_communication_ratio",
+        "cloud_call_reduction",
+        "speedup_vs_cloud"
+    ]
+
+    mean_df = result_df[metric_cols].mean().to_frame(name="mean")
+    std_df = result_df[metric_cols].std().to_frame(name="std")
+
+    mean_df.to_csv("edge_cloud_kfold_mean.csv")
+    std_df.to_csv("edge_cloud_kfold_std.csv")
+
+    print("\nMean results:")
+    print(mean_df)
+
+    print("\nStd results:")
+    print(std_df)
+
+    print("\nSaved mean results to: edge_cloud_kfold_mean.csv")
+    print("Saved std results to: edge_cloud_kfold_std.csv")
+
+    return result_df
+
+
+if __name__ == "__main__":
+    run_experiment(
+        fold_dir=FOLD_DIR,
+        n_splits=N_SPLITS,
+        random_state=RANDOM_STATE,
+        output_csv=OUTPUT_CSV
+    )
